@@ -67,46 +67,48 @@ def extract_json(text):
 
 def verify_and_update_key(user_key, mode="check"):
     try:
-        # 1. Авторизация
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        
+        # Берем данные из st.secrets (TOML), а не из файла credentials.json
+        creds_info = st.secrets["gcp_service_account"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(creds_info), scope)
         client_gs = gspread.authorize(creds)
         
-        # 2. Открываем таблицу
         sheet = client_gs.open("SlideGen_DB").sheet1
-        
-        # Получаем все ключи из первой колонки
         keys_list = sheet.col_values(1) 
         
         if user_key not in keys_list:
             return False, "Ключ не найден!"
             
-        # Находим строку
         row_idx = keys_list.index(user_key) + 1
         row_data = sheet.row_values(row_idx)
         
-        # 3. Проверка срока действия
         expiry_date = datetime.strptime(row_data[1], "%Y-%m-%d")
         if datetime.now() > expiry_date:
             return False, "Срок ключа истек!"
             
-        # 4. Проверка лимитов
         limit = int(row_data[2])
         if limit <= 0:
             return False, "Лимиты исчерпаны!"
             
-        # --- ЛОГИКА ОБНОВЛЕНИЯ ---
         if mode == "update":
             new_limit = limit - 1
-            sheet.update_cell(row_idx, 3, new_limit) # Обновляем в Google Таблице
+            sheet.update_cell(row_idx, 3, new_limit) 
             return True, new_limit
         
-        # Если mode="check", просто возвращаем текущий лимит без списания
         return True, limit
-
     except Exception as e:
         return False, f"Ошибка базы: {str(e)}"
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def extract_json(text):
+    try:
+        start = text.find('{')
+        end = text.rfind('}') + 1
+        if start != -1 and end != 0:
+            return json.loads(text[start:end])
+        return None
+    except: return None
 
 # --- ФУНКЦИЯ ГЕНЕРАЦИИ ТЕКСТА ЧЕРЕЗ GROQ ---
 def get_ai_content(topic, lang, slides_count, user_font_size):
@@ -937,3 +939,4 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**ОСНОВАТЕЛИ: {APP_FOUNDER}**")
+
