@@ -1,0 +1,10 @@
+streamlit
+python-pptx
+groq
+google-generativeai
+openai
+gspread
+oauth2client
+python-dotenv
+pandas
+requests
