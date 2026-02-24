@@ -300,56 +300,158 @@ def get_effective_slide_query(slide_data, topic):
     final_query = (f"{model_base} {tail}").strip()
     return re.sub(r"\s+", " ", final_query)
 
-def score_pexels_photo(photo, query_tokens):
+def score_duckduckgo_result(result, query_tokens):
     score = 0
-    alt = str(photo.get("alt", "")).lower()
-    url = str(photo.get("url", "")).lower()
-    photographer = str(photo.get("photographer", "")).lower()
-    haystack = f"{alt} {url} {photographer}"
+    title = str(result.get("title", "")).lower()
+    source = str(result.get("source", "")).lower()
+    page_url = str(result.get("url", "")).lower()
+    image_url = str(result.get("image", "")).lower()
+    haystack = f"{title} {source} {page_url} {image_url}"
+
     for token in query_tokens:
         if token in haystack:
             score += 2
-    # Бонус за "portrait", если в запросе есть персона
-    if any(k in query_tokens for k in ["churchill", "person", "leader", "portrait"]) and "portrait" in haystack:
-        score += 2
-    return score
 
-def search_pexels_image(query):
-    if not query or not os.getenv("PEXELS_API_KEY"):
-        return None
-
-    headers = {
-        "Authorization": os.getenv("PEXELS_API_KEY")
-    }
-    params = {
-        "query": query,
-        "per_page": 8,
-        "orientation": "landscape"
-    }
-
+    # Предпочитаем картинки с нормальным соотношением сторон для слайда.
     try:
-        r = requests.get(
-            "https://api.pexels.com/v1/search",
-            headers=headers,
-            params=params,
-            timeout=5
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("photos"):
-                query_tokens = [t.lower() for t in re.findall(r"[A-Za-z0-9-]{3,}", query) if t.lower() not in STOPWORDS]
-                ranked = sorted(
-                    data["photos"],
-                    key=lambda p: score_pexels_photo(p, query_tokens),
-                    reverse=True
-                )
-                for photo in ranked:
-                    src = photo.get("src", {})
-                    if src.get("large"):
-                        return src["large"]
+        w = int(result.get("width") or 0)
+        h = int(result.get("height") or 0)
+        if w >= 1000 and h >= 550:
+            score += 2
+        if h > 0:
+            ratio = w / h
+            if 1.2 <= ratio <= 2.2:
+                score += 2
     except:
         pass
 
+    if image_url.endswith((".jpg", ".jpeg", ".png")):
+        score += 1
+    if image_url.endswith((".svg", ".webp")):
+        score -= 3
+
+    return score
+
+def get_duckduckgo_vqd(query):
+    if not query:
+        return None
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    try:
+        r = requests.get(
+            "https://duckduckgo.com/",
+            params={"q": query, "iax": "images", "ia": "images"},
+            headers=headers,
+            timeout=6
+        )
+        if r.status_code != 200:
+            return None
+        text = r.text
+        patterns = [
+            r"vqd='([^']+)'",
+            r'vqd="([^"]+)"',
+            r'"vqd":"([^"]+)"',
+            r"vqd=([0-9-]+)\&"
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1)
+    except:
+        pass
+    return None
+
+def search_duckduckgo_image(query):
+    if not query:
+        return None
+
+    vqd = get_duckduckgo_vqd(query)
+    if not vqd:
+        return None
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": f"https://duckduckgo.com/?q={quote(query)}&iax=images&ia=images"
+    }
+    params = {
+        "l": "wt-wt",
+        "o": "json",
+        "q": query,
+        "vqd": vqd,
+        "f": ",,,"
+    }
+
+    try:
+        r = requests.get("https://duckduckgo.com/i.js", headers=headers, params=params, timeout=8)
+        if r.status_code != 200:
+            return None
+        items = r.json().get("results", [])
+        if not items:
+            return None
+
+        query_tokens = [
+            t.lower()
+            for t in re.findall(r"[A-Za-zА-Яа-я0-9-]{3,}", query)
+            if t.lower() not in STOPWORDS
+        ]
+        ranked = sorted(items, key=lambda x: score_duckduckgo_result(x, query_tokens), reverse=True)
+
+        for item in ranked:
+            image_url = item.get("image") or item.get("thumbnail")
+            if not image_url:
+                continue
+            if image_url.startswith("//"):
+                image_url = f"https:{image_url}"
+            if not image_url.startswith(("http://", "https://")):
+                continue
+            low = image_url.lower()
+            if low.endswith(".svg"):
+                continue
+            return image_url
+    except:
+        pass
+    return None
+
+def fetch_ppt_compatible_image(image_url, timeout=7):
+    if not image_url:
+        return None
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "image/*,*/*;q=0.8",
+        "Referer": "https://duckduckgo.com/"
+    }
+    try:
+        r = requests.get(image_url, headers=headers, timeout=timeout)
+        if r.status_code != 200 or not r.content:
+            return None
+        data = r.content
+        ctype = str(r.headers.get("Content-Type", "")).lower()
+
+        # JPEG / PNG напрямую поддерживаются python-pptx.
+        if data[:2] == b"\xff\xd8" or data[:8] == b"\x89PNG\r\n\x1a\n":
+            return data
+        if "jpeg" in ctype or "jpg" in ctype or "png" in ctype:
+            return data
+
+        # Пробуем конвертировать WEBP и другие форматы, если Pillow доступен.
+        if "svg" in ctype or image_url.lower().endswith(".svg"):
+            return None
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(data)) as img:
+                out = io.BytesIO()
+                if img.mode in ("RGBA", "LA", "P"):
+                    img.convert("RGBA").save(out, format="PNG")
+                else:
+                    img.convert("RGB").save(out, format="JPEG")
+                return out.getvalue()
+        except Exception:
+            return None
+    except:
+        pass
     return None
 
 def search_wikimedia_image(query):
@@ -403,19 +505,31 @@ def resolve_slide_image(slide_data, topic):
     if not query:
         return None
 
-    # Для персон и исторических лидеров сначала Wikipedia/Wikimedia (точнее портреты)
-    if has_person_name_hint(query) or any(k in query.lower() for k in ["portrait", "leader", "president", "king", "prime minister"]):
-        wiki_img = search_wikimedia_image(query)
-        if wiki_img:
-            return wiki_img
+    person_context = has_person_name_hint(query) or any(
+        k in query.lower() for k in ["portrait", "leader", "president", "king", "prime minister"]
+    )
 
-    # Затем Pexels
-    pexels_img = search_pexels_image(query)
-    if pexels_img:
-        return pexels_img
+    candidates = []
 
-    # Последний fallback
-    return search_wikimedia_image(query)
+    # Для персон и исторических лидеров сначала Wikipedia/Wikimedia (точнее портреты).
+    if person_context:
+        candidates.append(search_wikimedia_image(query))
+
+    # Затем DuckDuckGo Images.
+    candidates.append(search_duckduckgo_image(query))
+
+    # Последний fallback: снова Wikipedia/Wikimedia.
+    candidates.append(search_wikimedia_image(query))
+
+    checked = set()
+    for image_url in candidates:
+        if not image_url or image_url in checked:
+            continue
+        checked.add(image_url)
+        img_data = fetch_ppt_compatible_image(image_url)
+        if img_data:
+            return img_data
+    return None
 
 
 def create_pptx(ai_json_text, template_folder, user_font_size=20, topic="", include_images=True, image_slide_word_ratio=1.0):
@@ -451,10 +565,10 @@ def create_pptx(ai_json_text, template_folder, user_font_size=20, topic="", incl
         # Проверка, нужен ли слот для фото
         show_image_space = include_images and (i % 2 == 1)
 
-        # Инициализация image_url всегда, чтобы не было ошибки
-        image_url = None
+        # Инициализация image_data всегда, чтобы не было ошибки
+        image_data = None
         if show_image_space:
-            image_url = resolve_slide_image(slide_data, topic)
+            image_data = resolve_slide_image(slide_data, topic)
 
         
         # Фон слайда
@@ -473,11 +587,10 @@ def create_pptx(ai_json_text, template_folder, user_font_size=20, topic="", incl
         accent_color = RGBColor(0, 255, 127)
         b_width = Inches(7.5) if show_image_space else Inches(11.5)
 
-# Добавление картинки
-        if image_url:
+        # Добавление картинки
+        if image_data:
             try:
-                img_data = requests.get(image_url, timeout=5).content
-                slide.shapes.add_picture(io.BytesIO(img_data),
+                slide.shapes.add_picture(io.BytesIO(image_data),
                                          Inches(8.6), Inches(1.2),
                                          Inches(4.2), Inches(4.8))
             except:
@@ -939,4 +1052,3 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**ОСНОВАТЕЛИ: {APP_FOUNDER}**")
-
